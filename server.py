@@ -30,14 +30,24 @@ across different machines via a relay API.
 
 No external dependencies required -- uses only Python standard library.
 
+Features:
+    - Peer discovery and registration
+    - Cross-machine message relay
+    - Auto-receive: background polling with push notifications via
+      the claude/channel MCP extension
+
 Configuration (environment variables):
     AGENT_RELAY_URL   - Base URL of the relay API endpoint (required)
     AGENT_RELAY_TOKEN - Bearer token for API authentication (required)
+    AGENT_RELAY_PEER_ID - Your peer ID for auto-receive (optional)
+    AGENT_RELAY_POLL_INTERVAL - Polling interval in seconds (default: 30)
 """
 
 import json
 import os
 import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 
@@ -46,11 +56,25 @@ import urllib.error
 # ---------------------------------------------------------------------------
 
 SERVER_NAME = "agent-relay"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 ENV_URL = "AGENT_RELAY_URL"
 ENV_TOKEN = "AGENT_RELAY_TOKEN"
+ENV_PEER_ID = "AGENT_RELAY_PEER_ID"
+ENV_POLL_INTERVAL = "AGENT_RELAY_POLL_INTERVAL"
+
+DEFAULT_POLL_INTERVAL = 30  # seconds
+
+# Thread-safe stdout access
+_stdout_lock = threading.Lock()
+
+# Registered peer ID (set by relay_register or env var)
+_peer_id = None
+_peer_id_lock = threading.Lock()
+
+# Flag to stop the polling thread on shutdown
+_shutdown = threading.Event()
 
 
 def _get_config():
@@ -62,6 +86,14 @@ def _get_config():
     url = os.environ.get(ENV_URL, "").strip()
     token = os.environ.get(ENV_TOKEN, "").strip()
     return url or None, token or None
+
+
+def _get_poll_interval():
+    """Read the polling interval from environment, with a sane default."""
+    try:
+        return int(os.environ.get(ENV_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
+    except (ValueError, TypeError):
+        return DEFAULT_POLL_INTERVAL
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +174,73 @@ def _read_message():
 
 
 def _write_message(msg):
-    """Write a JSON-RPC message to stdout."""
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    """Thread-safe write of a JSON-RPC message to stdout."""
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Auto-receive: background polling + channel push
+# ---------------------------------------------------------------------------
+
+def _push_channel_notification(content, meta=None):
+    """Push a message into the Claude Code session via claude/channel.
+
+    This uses the experimental claude/channel MCP extension, the same
+    mechanism that claude-peers-mcp uses for instant local notifications.
+    """
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": meta or {},
+        },
+    }
+    _write_message(notification)
+
+
+def _poll_loop():
+    """Background thread: poll the relay API for new messages and push them.
+
+    Runs until _shutdown is set. Sleeps for the configured interval between
+    polls. Uses the registered peer ID to check for messages.
+    """
+    interval = _get_poll_interval()
+
+    while not _shutdown.is_set():
+        _shutdown.wait(interval)
+        if _shutdown.is_set():
+            break
+
+        with _peer_id_lock:
+            peer_id = _peer_id
+
+        if peer_id is None:
+            continue
+
+        try:
+            result = _api_call("poll", params={"peer_id": peer_id})
+
+            if isinstance(result, list):
+                for msg in result:
+                    _push_channel_notification(
+                        content=msg.get("message", ""),
+                        meta={
+                            "from_id": msg.get("from_id", "unknown"),
+                            "timestamp": msg.get("timestamp", ""),
+                            "message_id": msg.get("id", ""),
+                        },
+                    )
+        except Exception:
+            pass  # Silently ignore polling errors; will retry next cycle
+
+
+def _start_polling():
+    """Start the background polling thread (daemon, so it dies with main)."""
+    thread = threading.Thread(target=_poll_loop, daemon=True)
+    thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -153,16 +249,43 @@ def _write_message(msg):
 
 def _handle_initialize(msg):
     """Respond to the MCP initialize handshake."""
+    global _peer_id
+
+    # If peer ID is set via env var, use it immediately
+    env_peer_id = os.environ.get(ENV_PEER_ID, "").strip()
+    if env_peer_id:
+        with _peer_id_lock:
+            _peer_id = env_peer_id
+
     return {
         "jsonrpc": "2.0",
         "id": msg["id"],
         "result": {
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "experimental": {"claude/channel": {}},
+            },
             "serverInfo": {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
             },
+            "instructions": (
+                "You are connected to Agent Relay, a cross-machine "
+                "communication network for AI coding agents.\n\n"
+                "IMPORTANT: When you receive a "
+                '<channel source="agent-relay" ...> message, '
+                "RESPOND IMMEDIATELY. Pause what you are doing, reply "
+                "using relay_send_message, then resume your work. "
+                "Treat incoming messages like a coworker tapping you on "
+                "the shoulder.\n\n"
+                "Available tools:\n"
+                "- relay_list_peers: Discover other agent instances\n"
+                "- relay_register: Register yourself (enables auto-receive)\n"
+                "- relay_send_message: Send a message to another agent\n"
+                "- relay_check_messages: Manually check for new messages\n"
+                "- relay_set_summary: Update your status summary"
+            ),
         },
     }
 
@@ -193,7 +316,9 @@ def _handle_tools_list(msg):
             "name": "relay_register",
             "description": (
                 "Register yourself as an active peer. Also serves as a "
-                "heartbeat -- call periodically to signal that you are alive."
+                "heartbeat -- call periodically to signal that you are alive. "
+                "Once registered, auto-receive is enabled: incoming messages "
+                "will be pushed into your session automatically."
             ),
             "inputSchema": {
                 "type": "object",
@@ -248,7 +373,8 @@ def _handle_tools_list(msg):
             "name": "relay_send_message",
             "description": (
                 "Send a message to another peer via the relay. "
-                "The recipient can retrieve it by polling for new messages."
+                "If the recipient has auto-receive enabled, the message "
+                "will be pushed into their session immediately."
             ),
             "inputSchema": {
                 "type": "object",
@@ -272,8 +398,9 @@ def _handle_tools_list(msg):
         {
             "name": "relay_check_messages",
             "description": (
-                "Poll for new unread messages addressed to you. "
-                "Returns a list of messages (may be empty)."
+                "Manually check for new unread messages. With auto-receive "
+                "enabled (after calling relay_register), messages are pushed "
+                "automatically -- but you can use this as a fallback."
             ),
             "inputSchema": {
                 "type": "object",
@@ -297,6 +424,8 @@ def _handle_tools_list(msg):
 
 def _handle_tool_call(msg):
     """Dispatch a tools/call request to the appropriate API action."""
+    global _peer_id
+
     params = msg.get("params", {})
     name = params.get("name", "")
     args = params.get("arguments", {})
@@ -308,11 +437,18 @@ def _handle_tool_call(msg):
         result = _api_call("list", params=query_params)
 
     elif name == "relay_register":
+        # Register with the API
         result = _api_call("register", method="POST", data={
             "peer_id": args["peer_id"],
             "platform": args.get("platform", "unknown"),
             "summary": args.get("summary", ""),
         })
+
+        # Enable auto-receive by storing the peer ID
+        if isinstance(result, dict) and result.get("ok"):
+            with _peer_id_lock:
+                _peer_id = args["peer_id"]
+            result["auto_receive"] = "enabled"
 
     elif name == "relay_set_summary":
         result = _api_call("summary", method="POST", data={
@@ -355,8 +491,11 @@ def main():
     """Run the MCP stdio server.
 
     Reads JSON-RPC messages from stdin, dispatches them to the appropriate
-    handler, and writes responses to stdout. Runs until EOF on stdin.
+    handler, and writes responses to stdout. Starts background polling for
+    auto-receive after initialization.
     """
+    polling_started = False
+
     while True:
         msg = _read_message()
         if msg is None:
@@ -367,7 +506,10 @@ def main():
         if method == "initialize":
             _write_message(_handle_initialize(msg))
         elif method == "notifications/initialized":
-            pass  # Acknowledgement notification -- no response needed
+            # Client is ready -- start background polling
+            if not polling_started:
+                _start_polling()
+                polling_started = True
         elif method == "tools/list":
             _write_message(_handle_tools_list(msg))
         elif method == "tools/call":
@@ -386,6 +528,9 @@ def main():
                         "message": f"Method not found: {method}",
                     },
                 })
+
+    # Clean shutdown
+    _shutdown.set()
 
 
 if __name__ == "__main__":

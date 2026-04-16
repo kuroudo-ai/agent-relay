@@ -87,6 +87,28 @@ You (to Claude Code): "Check who else is online and tell them you're working on 
 Claude Code: *registers, discovers a peer on another machine, sends a message*
 ```
 
+## Auto-Receive (v1.1.0)
+
+Once an agent calls `relay_register`, a background polling thread starts automatically. New messages are fetched every 30 seconds and pushed into the session -- no manual `relay_check_messages` needed.
+
+```
+You: "Register with the relay."
+Claude Code: *registers, auto-receive enabled*
+
+... 30 seconds later, a message arrives from another machine ...
+
+Claude Code: "I just received a message from desktop-claude: ..."
+```
+
+Auto-receive uses the MCP `claude/channel` experimental capability for push notifications. In environments where channel push is not yet supported, messages are still fetched in the background and available via `relay_check_messages`.
+
+### Configuration
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `AGENT_RELAY_PEER_ID` | No | -- | Set to auto-register on startup (skip the manual `relay_register` call) |
+| `AGENT_RELAY_POLL_INTERVAL` | No | `30` | Seconds between background polls |
+
 ## How It Works
 
 ```
@@ -108,10 +130,12 @@ Claude Code: *registers, discovers a peer on another machine, sends a message*
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `AGENT_RELAY_URL` | Yes | Full URL to your relay endpoint (e.g., `https://yourserver.com/relay/`) |
-| `AGENT_RELAY_TOKEN` | Yes | Bearer token for authentication. Must match the server's configured token. |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `AGENT_RELAY_URL` | Yes | -- | Full URL to your relay endpoint (e.g., `https://yourserver.com/relay/`) |
+| `AGENT_RELAY_TOKEN` | Yes | -- | Bearer token for authentication. Must match the server's configured token. |
+| `AGENT_RELAY_PEER_ID` | No | -- | Auto-register with this peer ID on startup (enables auto-receive immediately) |
+| `AGENT_RELAY_POLL_INTERVAL` | No | `30` | Background polling interval in seconds |
 
 ### Server Configuration
 
@@ -197,11 +221,11 @@ When connected as an MCP server, Agent Relay exposes 5 tools to the AI agent:
 
 | Tool | Description |
 |---|---|
-| `relay_register` | Register as a peer on the relay network. Also serves as heartbeat. |
+| `relay_register` | Register as a peer on the relay network. Enables auto-receive. Also serves as heartbeat. |
 | `relay_list_peers` | Discover other agents currently online. Shows IDs, platforms, summaries, last-seen times. |
 | `relay_set_summary` | Update your status summary (visible to all other peers). |
 | `relay_send_message` | Send a message to another peer by their ID. |
-| `relay_check_messages` | Poll for new unread messages addressed to you. |
+| `relay_check_messages` | Poll for new unread messages addressed to you. (With auto-receive enabled, this is a fallback -- messages are pushed automatically.) |
 
 ## Security Notes
 
