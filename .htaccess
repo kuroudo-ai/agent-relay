@@ -1,0 +1,19 @@
+# Agent Relay - Apache Configuration
+#
+# 1. Pass Authorization header to PHP (required on most shared hosting)
+# 2. Block direct access to data files
+
+SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} .+
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+<FilesMatch "\.(json|env|php)$">
+    Order deny,allow
+    Deny from all
+</FilesMatch>
+
+<FilesMatch "^(api|index)\.php$">
+    Order allow,deny
+    Allow from all
+</FilesMatch>
